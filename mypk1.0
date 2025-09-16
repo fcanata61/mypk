@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# mypm_prototype.sh
+# Protótipo funcional minimalista do mypm em shell (Bash).
+# Funcionalidades implementadas: sync (git), build, install, remove, clean, search, info
+# Diretórios padrão (pode editar via variáveis abaixo).
+
+set -euo pipefail
+IFS=$'\n\t'
+
+ROOT_PORTS="/usr/lib/ports"
+LOCAL_PORTS_DIR="$ROOT_PORTS"
+VAR_LIB="/var/lib/mypm"
+BIN_DIR="$VAR_LIB/bin"
+SRC_CACHE="$VAR_LIB/sources"
+INSTALLED_DIR="$VAR_LIB/installed"
+LOG_DIR="/var/log/mypm"
+
+# Colors
+C_RESET="\e[0m"
+C_INFO="\e[1;34m"
+C_OK="\e[1;32m"
+C_WARN="\e[1;33m"
+C_ERR="\e[1;31m"
+C_ACTION="\e[1;35m"
+
+# Helpers
+eecho(){ printf "%b\n" "$1"; }
+info(){ eecho "${C_INFO}>>> $*${C_RESET}"; }
+ok(){ eecho "${C_OK}>>> $*${C_RESET}"; }
+warn(){ eecho "${C_WARN}>>> $*${C_RESET}"; }
+err(){ eecho "${C_ERR}>>> $*${C_RESET}"; }
+action(){ eecho "${C_ACTION}>>> $*${C_RESET}"; }
+
+# Ensure directories
+ensure_dirs(){
+  mkdir -p "$LOCAL_PORTS_DIR" "$VAR_LIB" "$BIN_DIR" "$SRC_CACHE" "$INSTALLED_DIR" "$LOG_DIR"
+}
+
+# Read a simple key file in port dir (file contains plain content)
+read_field(){ # $1=portdir $2=field
+  local portdir="$1" field="$2"
+  if [ -f "$portdir/$field" ]; then
+    sed -n '1p' "$portdir/$field"
+  else
+    echo ""
+  fi
+}
+
+# Find port directory for a given name (first match)
+find_port(){ # $1=name (or name-version)
+  local name="$1"
+  # exact match
+  if [ -d "$LOCAL_PORTS_DIR/$name" ]; then
+    echo "$LOCAL_PORTS_DIR/$name"; return 0
+  fi
+  # search subdirs
+  local res
+  res=$(find "$LOCAL_PORTS_DIR" -maxdepth 3 -type d -name "$name*" | head -n1 || true)
+  if [ -n "$res" ]; then echo "$res"; return 0; fi
+  return 1
+}
+
+# Parse name and version from port dir basename (e.g. gcc-12.2)
+port_name_ver_from_dir(){ basename "$1"; }
+
+# download sources listed in port's source file to /tmp build dir and copy to SRC_CACHE
+download_sources(){
+  local portdir="$1" tmpd="$2"
+  local srcfile="$portdir/source"
+  mkdir -p "$tmpd/download"
+  if [ -f "$srcfile" ]; then
+    while IFS= read -r url; do
+      [ -z "$url" ] && continue
+      action "Download: $url"
+      local fname=$(basename "$url")
+      if [ -f "$SRC_CACHE/$fname" ]; then
+        info "Fonte já em cache: $SRC_CACHE/$fname"
+        cp -a "$SRC_CACHE/$fname" "$tmpd/download/"
+      else
+        if command -v curl >/dev/null 2>&1; then
+          curl -L --fail -o "$tmpd/download/$fname" "$url"
+        elif command -v wget >/dev/null 2>&1; then
+          wget -O "$tmpd/download/$fname" "$url"
+        else
+          err "Nenhum downloader (curl/wget) disponível"
+          return 1
+        fi
+        cp -a "$tmpd/download/$fname" "$SRC_CACHE/"
+      fi
+    done < "$srcfile"
+  else
+    warn "Nenhum arquivo 'source' na receita; assumindo código já presente"
+  fi
+}
+
+# extract all archives in download into src/
+extract_sources(){ local tmpd="$1"; local srcdir="$2"; mkdir -p "$srcdir"; 
+  for a in "$tmpd/download"/*; do
+    [ -e "$a" ] || continue
+    action "Extraindo: $(basename "$a")"
+    case "$a" in
+      *.tar.gz|*.tgz) tar -xzf "$a" -C "$srcdir" ;;
+      *.tar.xz) tar -xJf "$a" -C "$srcdir" ;;
+      *.zip) unzip -q "$a" -d "$srcdir" ;;
+      *) warn "Formato desconhecido: $a - copiando como está"; cp -a "$a" "$srcdir/";;
+    esac
+  done
+}
+
+apply_patches(){ local portdir="$1" srcdir="$2"; 
+  if [ -d "$portdir/patches" ]; then
+    for p in "$portdir/patches"/*; do
+      [ -e "$p" ] || continue
+      action "Aplicando patch: $(basename "$p")"
+      patch -p1 -d "$srcdir" < "$p" || warn "Patch $(basename "$p") pode ter falhado"
+    done
+  fi
+}
+
+run_build_script(){ local portdir="$1" tmpd="$2" srcroot="$3" ;
+  local build_script="$portdir/build"
+  if [ ! -f "$build_script" ]; then
+    err "Receita não contém arquivo 'build'"
+    return 1
+  fi
+  # Provide environment variables expected by recipe
+  export TMPDIR="$tmpd"
+  export SRC="$srcroot"
+  export BUILD="$tmpd/build"
+  export PKG="$tmpd/pkg"
+  mkdir -p "$BUILD" "$PKG"
+  info "Executando build script"
+  set +e
+  (cd "$BUILD" && /bin/sh "$build_script") > "$tmpd/logs/build.log" 2>&1
+  local rc=$?
+  set -e
+  if [ $rc -ne 0 ]; then
+    err "Build falhou. Ver log: $tmpd/logs/build.log"
+    echo "status=failed" > "$tmpd/status"
+    return $rc
+  fi
+  echo "status=success" > "$tmpd/status"
+  ok "Build concluído com sucesso"
+}
+
+pkg_pack(){ local tmpd="$1" name="$2" ver="$3" ;
+  mkdir -p "$BIN_DIR"
+  local pkgname="${name}-${ver}-1.pkg.tar.gz"
+  action "Empacotando em $BIN_DIR/$pkgname"
+  (cd "$tmpd/pkg" && tar -czf "$BIN_DIR/$pkgname" .)
+  ok "Pacote salvo em $BIN_DIR/$pkgname"
+  echo "$BIN_DIR/$pkgname"
+}
+
+install_from_pkg(){ local pkgpath="$1" fakeroot_mode="$2";
+  if [ ! -f "$pkgpath" ]; then err "Pacote não encontrado: $pkgpath"; return 1; fi
+  action "Instalando pacote $pkgpath"
+  if [ "$fakeroot_mode" = true ]; then
+    if command -v fakeroot >/dev/null 2>&1; then
+      fakeroot sh -c "tar -xpf '$pkgpath' -C /"
+    else
+      warn "fakeroot não encontrado — extraindo sem alterar owner/perm"; tar -xpf "$pkgpath" -C /
+    fi
+  else
+    if [ "$EUID" -ne 0 ]; then
+      warn "Instalação real requer root. Use sudo para executar a extração no sistema. Tentando usar sudo..."
+      sudo tar -xpf "$pkgpath" -C /
+    else
+      tar -xpf "$pkgpath" -C /
+    fi
+  fi
+}
+
+register_installed(){ local name="$1" ver="$2" tmpd="$3" pkgpath="$4";
+  local destdir="$INSTALLED_DIR/${name}-${ver}"
+  mkdir -p "$destdir"
+  # manifest
+  cat > "$destdir/manifest" <<EOF
+name=${name}
+version=${ver}
+installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+package=${pkgpath}
+EOF
+  # files.list (attempt to read list from pkg by listing tar contents)
+  mkdir -p "$destdir"
+  tar -tzf "$pkgpath" > "$destdir/files.list" || true
+  cp -a "$tmpd/logs/build.log" "$destdir/" 2>/dev/null || true
+  ok "Registrado em $destdir"
+  # update installed.db simple index
+  echo "${name},${ver},${destdir}" >> "$VAR_LIB/installed.db"
+}
+
+# COMMANDS
+cmd_sync(){
+  action "Sync: atualizando /usr/lib/ports (git clone/pull se houver repos configurados)"
+  # For prototype: try to `git pull` in existing port dirs, otherwise do nothing
+  if [ -d "$LOCAL_PORTS_DIR" ]; then
+    for d in "$LOCAL_PORTS_DIR"/*; do
+      [ -d "$d/.git" ] && (cd "$d" && git pull --rebase) || true
+    done
+  fi
+  ok "Sync concluído (protótipo)"
+}
+
+cmd_search(){ local term="$1"; action "Procurando $term"
+  find "$LOCAL_PORTS_DIR" -type d -maxdepth 3 -name "${term}*" -print | sed "s|$LOCAL_PORTS_DIR/||g" || true
+}
+
+cmd_info(){ local pkg="$1"; local portdir
+  portdir=$(find_port "$pkg") || { err "Porta não encontrada"; return 1; }
+  action "Informações de $pkg"
+  echo "Port dir: $portdir"
+  echo "Name: $(read_field "$portdir" name)" 
+  echo "Version: $(read_field "$portdir" version)"
+  echo "Source: $(read_field "$portdir" source)"
+  echo "Depend: " && cat "$portdir/depend" 2>/dev/null || echo "(nenhuma)"
+}
+
+cmd_build(){ local pkg="$1" force=${2:-false}
+  local portdir tmpd namever name ver
+  portdir=$(find_port "$pkg") || { err "Porta não encontrada: $pkg"; return 1; }
+  namever=$(port_name_ver_from_dir "$portdir")
+  name=$(read_field "$portdir" name)
+  ver=$(read_field "$portdir" version)
+  if [ -z "$name" ]; then name=$(echo "$namever" | sed 's/-[0-9].*$//'); fi
+  tmpd="/tmp/${name}-${ver}"
+  if [ -d "$tmpd" ] && [ "$force" != true ]; then warn "Diretório de trabalho existe em $tmpd — use --force para recriar"; return 1; fi
+  rm -rf "$tmpd" || true
+  mkdir -p "$tmpd/src" "$tmpd/build" "$tmpd/pkg" "$tmpd/download" "$tmpd/logs"
+  # download
+  download_sources "$portdir" "$tmpd"
+  # extract
+  extract_sources "$tmpd" "$tmpd/src"
+  # apply patches
+  apply_patches "$portdir" "$tmpd/src"
+  # run build script
+  run_build_script "$portdir" "$tmpd" "$tmpd/src"
+  # if build success, pack
+  local pkgpath
+  pkgpath=$(pkg_pack "$tmpd" "$name" "$ver")
+  echo "$pkgpath"
+  ok "Build complete for $name-$ver"
+}
+
+cmd_install(){ local pkg="$1" from_source=${2:-false} fakeroot_mode=${3:-false}
+  action "Install requested: $pkg"
+  # resolve port and name-version
+  local portdir name ver namever tmpd pkgpath
+  portdir=$(find_port "$pkg") || { err "Porta não encontrada: $pkg"; return 1; }
+  namever=$(port_name_ver_from_dir "$portdir")
+  name=$(read_field "$portdir" name); ver=$(read_field "$portdir" version)
+  tmpd="/tmp/${name}-${ver}"
+  if [ -f "$BIN_DIR/${name}-${ver}-1.pkg.tar.gz" ] && [ "$from_source" = false ]; then
+    pkgpath="$BIN_DIR/${name}-${ver}-1.pkg.tar.gz"
+    info "Usando binário disponível: $pkgpath"
+  else
+    info "Binário não encontrado ou --from-source solicitado — rodando build"
+    pkgpath=$(cmd_build "$pkg" false) || { err "Build falhou, abortando install"; return 1; }
+  fi
+  install_from_pkg "$pkgpath" "$fakeroot_mode"
+  register_installed "$name" "$ver" "/tmp/${name}-${ver}" "$pkgpath"
+  # cleanup on success
+  if [ -f "/tmp/${name}-${ver}/status" ] && grep -q "status=success" "/tmp/${name}-${ver}/status"; then
+    action "Limpando /tmp/${name}-${ver}"
+    rm -rf "/tmp/${name}-${ver}"
+  else
+    warn "/tmp/${name}-${ver} preservado para debug"
+  fi
+  ok "Instalação finalizada: $name-$ver"
+}
+
+cmd_remove(){ local pkg="$1" force=${2:-false}
+  action "Removendo $pkg"
+  # find installed manifest
+  local instdir
+  instdir=$(find "$INSTALLED_DIR" -maxdepth 1 -type d -name "${pkg}*" | head -n1 || true)
+  if [ -z "$instdir" ]; then err "Pacote não instalado: $pkg"; return 1; fi
+  if [ "$force" != true ]; then
+    # check reverse deps (very simple: scan installed.manifests)
+    local rdeps
+    rdeps=$(grep -rl "^depend=" -m1 "$INSTALLED_DIR" || true)
+  fi
+  # remove files
+  if [ -f "$instdir/files.list" ]; then
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      action "Removendo arquivo: $f"
+      sudo rm -f "$f" || true
+    done < "$instdir/files.list"
+  fi
+  # run post_remove hook if exists in port
+  local portdir
+  portdir=$(find_port "$pkg" || true)
+  if [ -n "$portdir" ] && [ -f "$portdir/files/post_remove" ]; then
+    action "Executando post_remove hook"
+    /bin/sh "$portdir/files/post_remove" || warn "post_remove hook falhou"
+  fi
+  rm -rf "$instdir"
+  ok "Pacote $pkg removido"
+}
+
+cmd_clean(){ local mode="$1" pkg="$2"
+  case "$mode" in
+    single)
+      if [ -z "$pkg" ]; then err "Use: mypm clean <pkg>"; return 1; fi
+      rm -rf "/tmp/${pkg}" || true
+      ok "Limpado /tmp/${pkg}"
+      ;;
+    all)
+      find /tmp -maxdepth 1 -type d -name "*-*" -exec rm -rf {} + || true
+      ok "Limpeza total de /tmp (protótipo)"
+      ;;
+    failed)
+      for d in /tmp/*; do
+        [ -f "$d/status" ] || continue
+        if grep -q "status=failed" "$d/status"; then rm -rf "$d" && ok "Removido $d"; fi
+      done
+      ;;
+    *) err "Modo desconhecido para clean"; return 1; ;;
+  esac
+}
+
+usage(){ cat <<EOF
+mypm_prototype.sh - protótipo do mypm
+
+Uso:
+  $0 sync
+  $0 search <term>
+  $0 info <pkg>
+  $0 build <pkg> [--force]
+  $0 install <pkg> [--from-source] [--fakeroot]
+  $0 remove <pkg> [--force]
+  $0 clean <pkg|--all|--failed>
+
+Exemplos:
+  $0 build firefox
+  $0 install firefox --fakeroot
+  $0 clean firefox
+
+Observações:
+ - Ports esperados em $LOCAL_PORTS_DIR
+ - Pacotes gerados em $BIN_DIR
+ - Fontes em cache em $SRC_CACHE
+ - Registros em $INSTALLED_DIR
+EOF
+}
+
+# Entrypoint
+main(){ ensure_dirs
+  if [ $# -lt 1 ]; then usage; exit 1; fi
+  cmd="$1"; shift
+  case "$cmd" in
+    sync) cmd_sync ;;
+    search) cmd_search "$1" ;;
+    info) cmd_info "$1" ;;
+    build) cmd_build "$1" ${2:-false} ;;
+    install) cmd_install "$1" ${2:-false} ${3:-false} ;;
+    remove) cmd_remove "$1" ${2:-false} ;;
+    clean)
+      if [ "$1" = "--all" ]; then cmd_clean all ; elif [ "$1" = "--failed" ]; then cmd_clean failed ; else cmd_clean single "$1"; fi ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
